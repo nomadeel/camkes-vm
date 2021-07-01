@@ -64,10 +64,11 @@
     attribute int num_extra_frame_caps; \
     attribute int extra_frame_map_address; \
     attribute { \
-        string linux_ram_base; \
-        string linux_ram_paddr_base; \
-        string linux_ram_size; \
-        string linux_ram_offset; \
+        string linux_ram_bases[]; \
+        string linux_ram_paddr_bases[]; \
+        string linux_ram_sizes[]; \
+        string linux_ram_offsets[]; \
+        string num_linux_ram_regions; \
         string dtb_addr; \
         string initrd_max_size; \
         string initrd_addr; \
@@ -79,6 +80,18 @@
         string linux_bootcmdline = ""; \
         string linux_stdout = ""; \
     } linux_image_config; \
+
+/*
+    attribute { \
+        string linux_ram_base; \
+        string linux_ram_paddr_base; \
+        string linux_ram_size; \
+        string linux_ram_offset; \
+        string dtb_addr; \
+        string initrd_max_size; \
+        string initrd_addr; \
+    } linux_address_config; \
+*/
 
 
 #define VM_COMPONENT_DEF(num) \

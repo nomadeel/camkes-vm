@@ -109,10 +109,11 @@ struct ps_io_ops _io_ops;
 
 static jmp_buf restart_jmp_buf;
 
-unsigned long linux_ram_base;
-unsigned long linux_ram_paddr_base;
-unsigned long linux_ram_size;
-unsigned long linux_ram_offset;
+unsigned long *linux_ram_bases;
+unsigned long *linux_ram_paddr_bases;
+unsigned long *linux_ram_sizes;
+unsigned long *linux_ram_offsets;
+unsigned long num_linux_ram_regions;
 unsigned long dtb_addr;
 unsigned long initrd_max_size;
 unsigned long initrd_addr;
@@ -452,9 +453,15 @@ static int vmm_init(void)
         cspacepath_t path;
         vka_cspace_make_path(vka, cap, &path);
         int utType = device ? ALLOCMAN_UT_DEV : ALLOCMAN_UT_KERNEL;
-        if (utType == ALLOCMAN_UT_DEV &&
-            paddr >= linux_ram_paddr_base && paddr <= (linux_ram_paddr_base + (linux_ram_size - 1))) {
-            utType = ALLOCMAN_UT_DEV_MEM;
+        uintptr_t untyped_end = paddr + (1 << size);
+        /* Mark Linux VM memory as being device so as to avoid other allocations stealing memory from that region */
+        if (utType == ALLOCMAN_UT_DEV) {
+        }
+        for (unsigned long j = 0; j < num_linux_ram_regions; j++) {
+            if (paddr >= linux_ram_paddr_bases[j] && paddr <= (linux_ram_paddr_bases[j] + (linux_ram_sizes[j] - 1)) ||
+                untyped_end >= linux_ram_paddr_bases[j] && untyped_end <= (linux_ram_paddr_bases[j] + (linux_ram_sizes[j] - 1 ))) {
+                utType = ALLOCMAN_UT_DEV_MEM;
+            }
         }
         err = allocman_utspace_add_uts(allocman, 1, &path, &size, &paddr, utType);
         assert(!err);
@@ -468,9 +475,12 @@ static int vmm_init(void)
             cspacepath_t path;
             vka_cspace_make_path(vka, cap, &path);
             int utType = ALLOCMAN_UT_DEV;
-            if (paddr >= linux_ram_paddr_base &&
-                paddr <= (linux_ram_paddr_base + (linux_ram_size - 1))) {
-                utType = ALLOCMAN_UT_DEV_MEM;
+            uintptr_t untyped_end = paddr + (1 << size);
+            for (unsigned long j = 0; j < num_linux_ram_regions; j++) {
+                if (paddr >= linux_ram_paddr_bases[j] && paddr <= (linux_ram_paddr_bases[j] + (linux_ram_sizes[j] - 1)) ||
+                    untyped_end >= linux_ram_paddr_bases[j] && untyped_end <= (linux_ram_paddr_bases[j] + (linux_ram_sizes[j] - 1 ))) {
+                    utType = ALLOCMAN_UT_DEV_MEM;
+                }
             }
             err = allocman_utspace_add_uts(allocman, 1, &path, &size, &paddr, utType);
             assert(!err);
@@ -500,9 +510,6 @@ static int vmm_init(void)
     err = vka_alloc_endpoint(vka, &fault_ep_obj);
     assert(!err);
     _fault_endpoint = fault_ep_obj.cptr;
-
-    err = sel4platsupport_new_malloc_ops(&_io_ops.malloc_ops);
-    assert(!err);
 
     /* Create an IRQ server */
     _irq_server = irq_server_new(vspace, vka, IRQSERVER_PRIO,
@@ -648,7 +655,6 @@ int install_linux_devices(vm_t *vm)
     int num_vmm_modules = 0;
     for (vmm_module_t *i = __start__vmm_module; i < __stop__vmm_module; i++) {
         test_types[num_vmm_modules] = i;
-        ZF_LOGE("module name: %s", i->name);
         i->init_module(vm, i->cookie);
         num_vmm_modules++;
     }
@@ -745,11 +751,14 @@ static int generate_fdt(vm_t *vm, void *fdt_ori, void *gen_fdt, int buf_size, si
         return -1;
     }
 
+    /* TODO Fix this up so that we generate all the nodes */
     /* generate a memory node (linux_ram_base and linux_ram_size) */
+    /*
     err = fdt_generate_memory_node(gen_fdt, linux_ram_base, linux_ram_size);
     if (err) {
         return -1;
     }
+    */
 
     /* generate a chosen node (linux_image_config.linux_bootcmdline, linux_stdout) */
     err = fdt_generate_chosen_node(gen_fdt, linux_image_config.linux_stdout, linux_image_config.linux_bootcmdline,
@@ -796,9 +805,9 @@ static int load_linux(vm_t *vm, const char *kernel_name, const char *dtb_name, c
         printf("Error: Failed to install Linux devices\n");
         return -1;
     }
-    /* Load kernel */
+    /* Load kernel into the first RAM region and hope it works */
     guest_kernel_image_t kernel_image_info;
-    err = vm_load_guest_kernel(vm, kernel_name, linux_ram_base, 0, &kernel_image_info);
+    err = vm_load_guest_kernel(vm, kernel_name, linux_ram_bases[0], 0, &kernel_image_info);
     entry = kernel_image_info.kernel_image.load_paddr;
     if (!entry || err) {
         return -1;
@@ -857,10 +866,45 @@ static int load_linux(vm_t *vm, const char *kernel_name, const char *dtb_name, c
 
 void parse_camkes_linux_attributes(void)
 {
+    num_linux_ram_regions = strtoul(linux_address_config.num_linux_ram_regions, NULL, 0);
+    if (num_linux_ram_regions == 0) {
+        ZF_LOGF("num_linux_ram_regions cannot be 0, check your configuration");
+    }
+
+    int error = ps_calloc(&_io_ops.malloc_ops, num_linux_ram_regions, sizeof(*linux_ram_bases),
+                          (void **) &linux_ram_bases);
+    if (error) {
+        ZF_LOGF("Failed to allocate memory for linux_ram_bases");
+    }
+    error = ps_calloc(&_io_ops.malloc_ops, num_linux_ram_regions, sizeof(*linux_ram_paddr_bases),
+                      (void **) &linux_ram_paddr_bases);
+    if (error) {
+        ZF_LOGF("Failed to allocate memory for linux_ram_paddr_bases");
+    }
+    error = ps_calloc(&_io_ops.malloc_ops, num_linux_ram_regions, sizeof(*linux_ram_sizes),
+                      (void **) &linux_ram_sizes);
+    if (error) {
+        ZF_LOGF("Failed to allocate memory for linux_ram_sizes");
+    }
+    error = ps_calloc(&_io_ops.malloc_ops, num_linux_ram_regions, sizeof(*linux_ram_offsets),
+                      (void **) &linux_ram_offsets);
+    if (error) {
+        ZF_LOGF("Failed to allocate memory for linux_ram_offsets");
+    }
+
+    for (unsigned long i = 0; i < num_linux_ram_regions; i++) {
+        linux_ram_bases[i] = strtoul(linux_address_config.linux_ram_bases[i], NULL, 0);
+        linux_ram_paddr_bases[i] = strtoul(linux_address_config.linux_ram_paddr_bases[i], NULL, 0);
+        linux_ram_sizes[i] = strtoul(linux_address_config.linux_ram_sizes[i], NULL, 0);
+        linux_ram_offsets[i] = strtoul(linux_address_config.linux_ram_offsets[i], NULL, 0);
+    }
+
+    /*
     linux_ram_base = strtoul(linux_address_config.linux_ram_base, NULL, 0);
     linux_ram_paddr_base = strtoul(linux_address_config.linux_ram_paddr_base, NULL, 0);
     linux_ram_size = strtoul(linux_address_config.linux_ram_size, NULL, 0);
     linux_ram_offset = strtoul(linux_address_config.linux_ram_offset, NULL, 0);
+    */
     dtb_addr = strtoul(linux_address_config.dtb_addr, NULL, 0);
     initrd_max_size = strtoul(linux_address_config.initrd_max_size, NULL, 0);
     initrd_addr = strtoul(linux_address_config.initrd_addr, NULL, 0);
@@ -1021,6 +1065,9 @@ int main_continued(void)
 {
     vm_t vm;
     int err;
+
+    err = sel4platsupport_new_malloc_ops(&_io_ops.malloc_ops);
+    assert(!err);
 
     parse_camkes_linux_attributes();
 
